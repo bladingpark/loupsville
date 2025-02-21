@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         LoupsVille
+// @name         LoupsVille dev
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.2.0
 // @description  wolvesville mod
 // @author       me
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wolvesville.com
@@ -32,13 +32,13 @@ var TOTAL_UP_LEVEL = 0
 var GAME_STARTED_AT = 0
 var DOCUMENT_TITLE = undefined
 var LV_SETTINGS = {
-  HIDE_USERNAME: false,
-  ALLOW_MULTI: true,
   DEBUG_MODE: false,
   SHOW_HIDDEN_LVL: true,
   AUTO_REPLAY: false,
+  AUTO_PLAY: false,
 }
 var AUTO_REPLAY_INTERVAL = undefined
+var SOCKET = undefined
 
 const main = async () => {
   getAuthtokens()
@@ -77,16 +77,6 @@ const injectSettings = () => {
   $('.lv-modal-loot-boxes-btn').on('click', () => {
     if (INVENTORY.lootBoxes?.length) lootBox()
   })
-  $('.lv-modal-checkbox.hide-player').on('click', () => {
-    LV_SETTINGS.HIDE_USERNAME = !LV_SETTINGS.HIDE_USERNAME
-    $('.lv-modal-checkbox.hide-player').text(LV_SETTINGS.HIDE_USERNAME ? '' : '')
-    saveSetting()
-  })
-  $('.lv-modal-checkbox.allow-multi').on('click', () => {
-    LV_SETTINGS.ALLOW_MULTI = !LV_SETTINGS.ALLOW_MULTI
-    $('.lv-modal-checkbox.allow-multi').text(LV_SETTINGS.ALLOW_MULTI ? '' : '')
-    saveSetting()
-  })
   $('.lv-modal-checkbox.debug').on('click', () => {
     LV_SETTINGS.DEBUG_MODE = !LV_SETTINGS.DEBUG_MODE
     $('.lv-modal-checkbox.debug').text(LV_SETTINGS.DEBUG_MODE ? '' : '')
@@ -103,11 +93,15 @@ const injectSettings = () => {
     handleAutoReplay()
     saveSetting()
   })
-  $('.lv-modal-checkbox.hide-player').text(LV_SETTINGS.HIDE_USERNAME ? '' : '')
-  $('.lv-modal-checkbox.allow-multi').text(LV_SETTINGS.ALLOW_MULTI ? '' : '')
+  $('.lv-modal-checkbox.auto-play').on('click', () => {
+    LV_SETTINGS.AUTO_PLAY = !LV_SETTINGS.AUTO_PLAY
+    $('.lv-modal-checkbox.auto-play').text(LV_SETTINGS.AUTO_PLAY ? '' : '')
+    saveSetting()
+  })
   $('.lv-modal-checkbox.debug').text(LV_SETTINGS.DEBUG_MODE ? '' : '')
   $('.lv-modal-checkbox.show-hidden-lvl').text(LV_SETTINGS.SHOW_HIDDEN_LVL ? '' : '')
   $('.lv-modal-checkbox.auto-replay').text(LV_SETTINGS.AUTO_REPLAY ? '' : '')
+  $('.lv-modal-checkbox.auto-play').text(LV_SETTINGS.AUTO_PLAY ? '' : '')
   handleAutoReplay()
 }
 
@@ -126,11 +120,10 @@ const handleAutoReplay = () => {
 
 const saveSetting = () => {
   let settings = {
-    HIDE_USERNAME: LV_SETTINGS.HIDE_USERNAME,
-    ALLOW_MULTI: LV_SETTINGS.ALLOW_MULTI,
     DEBUG_MODE: LV_SETTINGS.DEBUG_MODE,
     SHOW_HIDDEN_LVL: LV_SETTINGS.SHOW_HIDDEN_LVL,
     AUTO_REPLAY: LV_SETTINGS.AUTO_REPLAY,
+    AUTO_PLAY: LV_SETTINGS.AUTO_PLAY,
   }
   localStorage.setItem('lv-settings', JSON.stringify(settings))
 }
@@ -178,8 +171,12 @@ const setDocumentTitle = () => {
   document.title = DOCUMENT_TITLE || `🔥 LoupsVille v${VERSION}`
 }
 
+const getRole = (id) => {
+  return JSON.parse(localStorage.getItem('roles-meta-data')).roles[id]
+}
+
 const setRole = (id) => {
-  ROLE = JSON.parse(localStorage.getItem('roles-meta-data')).roles[id]
+  ROLE = getRole(id)
 }
 
 const getAuthtokens = () => {
@@ -213,18 +210,8 @@ const requestsToCatch = {
   'https://core.api-wolvesville.com/players/meAndCheckAppVersion': (data) => {
     if (data?.player) {
       const { username, level } = data.player
-      !PLAYER &&
-        addChatMsg(
-          `👋 ${LV_SETTINGS.HIDE_USERNAME ? '???' : username} (lvl ${LV_SETTINGS.HIDE_USERNAME ? '?' : level})`
-        )
+      !PLAYER && addChatMsg(`👋 ${username} (lvl ${level})`)
       PLAYER = data.player
-      if (LV_SETTINGS.HIDE_USERNAME) {
-        data.player.username = '???'
-        data.player.clanTag = '❓'
-        data.player.level = 10000
-        data.player.xpTotal = 0
-        return new Response(JSON.stringify(data))
-      }
     }
   },
   'https://core.api-wolvesville.com/inventory/lootBoxes/': (data) => {
@@ -244,7 +231,6 @@ const requestsToCatch = {
     }
   },
   'https://core.api-wolvesville.com/inventory?': (data, url) => {
-    console.log(data)
     if (data?.silverCount) {
       INVENTORY = data
     }
@@ -257,11 +243,10 @@ const requestsToCatch = {
       }
       $('.lv-modal-loot-boxes-status').text(`(${lootBoxes.length} 🎁 available)`)
     }
+    return new Response(JSON.stringify({ ...data, loyaltyTokenCount: 9999 }))
   },
   'https://game.api-wolvesville.com/api/public/game/running': (data) => {
-    if (LV_SETTINGS.ALLOW_MULTI) {
-      return new Response(JSON.stringify({ running: false }))
-    }
+    return new Response(JSON.stringify({ running: false }))
   },
   'https://core.api-wolvesville.com/rewards/goldenWheelSpin': (data) => {
     if (data?.length) {
@@ -362,19 +347,47 @@ const onMessage = (message) => {
   }
 }
 
-const messagesToCatch = {
-  'game-joined': (data) => {
+const connectSocket = (gameId, serverUrl) => {
+  if (SOCKET) return
+  var LOVERS = []
+  var DEADS = []
+  var JW_TARGET = undefined
+  var CHAT_WW_SENDED = false
+  var WOLVES = []
+  const url = `wss://${serverUrl.replace('https://', '')}/`
+  SOCKET = io(url, {
+    query: {
+      firebaseToken: AUTHTOKENS.idToken,
+      gameId,
+      reconnect: true,
+      // gameMode: 'custom',
+      // password: undefined,
+      ids: 1,
+      'Cf-JWT': AUTHTOKENS['Cf-JWT'],
+      apiV: 1,
+      EIO: 4,
+    },
+    transports: ['websocket'],
+  })
+  SOCKET.on('disconnect', () => {
+    addChatMsg('🤖 Parallel socket disconnected')
+    SOCKET = undefined
+  })
+  SOCKET.on('game-joined', () => {
     addChatMsg('🔗 Game joined')
     DOCUMENT_TITLE = '🔗 Game joined'
+    addChatMsg('🤖 Parallel socket connected')
+    // SOCKET.emit('lobby:chat-msg', JSON.stringify({ msg: 'test' }))
     ROLE = undefined
     setTimeout(setPlayersLevel, 1000)
-  },
-  'game-starting': (data) => {
+  })
+  SOCKET.on('game-starting', () => {
     GAME_STATUS = 'starting'
     addChatMsg('🚩 Game starting')
     DOCUMENT_TITLE = '🚩 Game starting'
-  },
-  'game-started': (data) => {
+  })
+  SOCKET.on('game-started', (_data) => {
+    const data = JSON.parse(_data)
     GAME_STATUS = 'started'
     addChatMsg('🚀 Game started')
     DOCUMENT_TITLE = '🚀 Game started'
@@ -384,8 +397,16 @@ const messagesToCatch = {
     DOCUMENT_TITLE = `⌛ ${ROLE.name}`
     PLAYERS = data.players
     setTimeout(setPlayersLevel, 1000)
-  },
-  'game-reconnect-set-players': (data) => {
+  })
+  SOCKET.on('players-and-equipped-items', (_data) => {
+    const data = JSON.parse(_data)
+    if (GAME_STATUS === 'started') {
+      PLAYERS = data.players
+      setTimeout(setPlayersLevel, 1000)
+    }
+  })
+  SOCKET.on('game-reconnect-set-players', (_data) => {
+    const data = JSON.parse(_data)
     PLAYERS = Object.values(data)
     setTimeout(setPlayersLevel, 1000)
     if (PLAYER) {
@@ -394,44 +415,29 @@ const messagesToCatch = {
         if (tmp.spectate) {
           DOCUMENT_TITLE = `🚀 Spectator`
           addChatMsg(`You are Spectator`, true, 'color: #FF4081;')
-        } else {
+        } else if (ROLE) {
           setRole(tmp.role)
-          DOCUMENT_TITLE = `🚀 ${tmp.gridIdx}. ${ROLE.name}`
+          DOCUMENT_TITLE = `🚀 ${tmp.gridIdx + 1}. ${ROLE.name}`
           addChatMsg(`You are ${ROLE.name} (${ROLE.id})`, true, 'color: #FF4081;')
         }
       }
     }
-  },
-  'game-night-started': (data) => {
-    setTimeout(setPlayersLevel, 1000)
+  })
+  SOCKET.on('game-night-started', () => {
     const tmp = PLAYERS.find((v) => v.id === PLAYER.id)
-    if (ROLE) DOCUMENT_TITLE = `🚀 ${tmp.gridIdx}. ${ROLE.name}`
-  },
-  'players-and-equipped-items': (data) => {
-    console.log(GAME_STATUS)
-    if (GAME_STATUS === 'started') {
-      console.log(data.players)
-      PLAYERS = data.players
-      setTimeout(setPlayersLevel, 1000)
-    }
-  },
-  'game-players-killed': (data) => {
+    if (tmp && ROLE) DOCUMENT_TITLE = `🚀 ${tmp.gridIdx + 1}. ${ROLE.name}`
+    setTimeout(setPlayersLevel, 1000)
+  })
+  SOCKET.on('game-players-killed', (_data) => {
+    const data = JSON.parse(_data)
     data['victims'].forEach((victim) => {
       const player = PLAYERS.find((v) => v.id === victim.targetPlayerId)
+      if (player) DEADS.push(player.id)
       const tmp = player ? `${parseInt(player.gridIdx) + 1}. ${player.username}` : '?'
       addChatMsg(`☠️ ${tmp} (${victim.targetPlayerRole}) by ${victim.cause}`)
     })
-  },
-  'game-over-awards-available': (data) => {
-    TOTAL_XP_SESSION += data.playerAward.awardedTotalXp
-    addChatMsg(`🧪 ${data.playerAward.awardedTotalXp} xp`)
-    if (data.playerAward.awardedLevels) {
-      PLAYER.level += data.playerAward.awardedLevels
-      TOTAL_UP_LEVEL += data.playerAward.awardedLevels
-      log(`🆙 ${PLAYER.level}`)
-    }
-  },
-  'game-game-over': (data) => {
+  })
+  SOCKET.on('game-game-over', () => {
     GAME_STATUS = 'over'
     let tmp = `🏁 Game over`
     if (GAME_STARTED_AT) {
@@ -441,6 +447,163 @@ const messagesToCatch = {
     }
     DOCUMENT_TITLE = tmp
     addChatMsg(tmp)
+  })
+  SOCKET.on('game-over-awards-available', (_data) => {
+    const data = JSON.parse(_data)
+    TOTAL_XP_SESSION += data.playerAward.awardedTotalXp
+    addChatMsg(`🧪 ${data.playerAward.awardedTotalXp} xp`)
+    if (data.playerAward.awardedLevels) {
+      PLAYER.level += data.playerAward.awardedLevels
+      TOTAL_UP_LEVEL += data.playerAward.awardedLevels
+      log(`🆙 ${PLAYER.level}`)
+    }
+    setTimeout(() => {
+      SOCKET.disconnect()
+    }, 100)
+  })
+  // Autoplay
+  if (LV_SETTINGS.AUTO_PLAY) {
+    SOCKET.on('game-cupid-lover-ids-and-roles', (_data) => {
+      const data = JSON.parse(_data)
+      if (PLAYER && ROLE) {
+        const loverPlayerIds = data.loverPlayerIds.filter((v) => v !== PLAYER.id)
+        const loverRoles = data.loverRoles.filter((v) => v !== ROLE.id)
+        LOVERS = loverPlayerIds.map((playerId, i) => ({ id: playerId, role: loverRoles[i] }))
+        let msg = ''
+        if (LOVERS.length === 1) {
+          const lover1 = PLAYERS.find((v) => v.id === LOVERS[0].id)
+          addChatMsg(`💘 Your lover is ${lover1.gridIdx + 1}. ${lover1.username} (${LOVERS[0].role})`)
+          if (ROLE.team === 'WEREWOLF') {
+            msg = `My lover is ${lover1.gridIdx + 1}, who is yours?`
+          }
+        } else if (LOVERS.length === 2) {
+          const lover1 = PLAYERS.find((v) => v.id === LOVERS[0].id)
+          const lover2 = PLAYERS.find((v) => v.id === LOVERS[1].id)
+          addChatMsg(
+            `💘 Your lovers are ${lover1.gridIdx + 1}. ${lover1.username} (${LOVERS[0].role}) and ${
+              lover2.gridIdx + 1
+            }. ${lover2.username} (${LOVERS[1].role})`
+          )
+          if (ROLE.team === 'WEREWOLF') {
+            msg = `My lovers are ${lover1.gridIdx + 1} and ${lover2.gridIdx + 1}, who is yours?`
+          }
+        }
+        if (!CHAT_WW_SENDED && msg) {
+          CHAT_WW_SENDED = true
+          SOCKET.emit('game:chat-werewolves:msg', JSON.stringify({ msg }))
+        }
+      }
+    })
+    SOCKET.on('game-night-started', () => {
+      setTimeout(() => {
+        if (ROLE && ROLE.team === 'WEREWOLF') {
+          const lover = LOVERS.find((v) => getRole(v.role).team !== 'WEREWOLF')
+          if (lover) {
+            const targetPlayer = PLAYERS.find((v) => v.id === lover.id)
+            if (targetPlayer) {
+              addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+            }
+            SOCKET.emit('game-werewolves-vote-set', JSON.stringify({ targetPlayerId: lover.id }))
+          }
+        }
+      }, 1000)
+    })
+    SOCKET.on('game-werewolves-set-roles', (_data) => {
+      const data = JSON.parse(_data)
+      WOLVES = Object.entries(data.werewolves).map(([id, role]) => ({ id, role }))
+    })
+    SOCKET.on('game:chat-werewolves:msg', (_data) => {
+      const data = JSON.parse(_data)
+      if (ROLE && ROLE.id === 'junior-werewolf' && data.msg && data.authorId !== PLAYER.id) {
+        const numbers = data.msg.match(/\d+/)
+        if (numbers.length) {
+          const gridIdx = parseInt(numbers[0])
+          const targetPlayer = PLAYERS.find((v) => v.gridIdx + 1 === gridIdx)
+          if (targetPlayer) {
+            JW_TARGET = targetPlayer.id
+            addChatMsg(`🐾 Select ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+            SOCKET.emit('game-junior-werewolf-selected-player', JSON.stringify({ targetPlayerId: targetPlayer.id }))
+          }
+        }
+      }
+    })
+    SOCKET.on('game-werewolves-vote-set', (_data) => {
+      const data = JSON.parse(_data)
+      if (!JW_TARGET && ROLE && ROLE.id === 'junior-werewolf' && data.playerId !== PLAYER.id) {
+        JW_TARGET = data.targetPlayerId
+        const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
+        if (targetPlayer) {
+          addChatMsg(`🐾 Select ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+        }
+        SOCKET.emit('game-junior-werewolf-selected-player', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+      }
+      // Case your teammate is junior wolf and you're not
+      if (
+        ROLE &&
+        ROLE.id !== 'junior-werewolf' &&
+        WOLVES.find((v) => v.role === 'junior-werewolf' && v.id === data.playerId)
+      ) {
+        const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
+        setTimeout(() => {
+          if (targetPlayer) {
+            addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+          }
+          SOCKET.emit('game-werewolves-vote-set', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+        }, 1000)
+      }
+    })
+    SOCKET.on('game-day-voting-started', () => {
+      if (PLAYER && !DEADS.includes(PLAYER.id)) {
+        const wwLover = LOVERS.find((v) => getRole(v.role).team === 'WEREWOLF')
+        if (wwLover) {
+          if (ROLE && ROLE.team === 'WEREWOLF') {
+            SOCKET.emit('game:chat-public:msg', JSON.stringify({ msg: 'wc' }))
+          }
+          const targetPlayer = PLAYERS.find((v) => v.id === wwLover.id)
+          if (targetPlayer) {
+            addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+          }
+          SOCKET.emit('game-day-vote-set', JSON.stringify({ targetPlayerId: wwLover.id }))
+        } else if (ROLE && ROLE.team === 'WEREWOLF') {
+          SOCKET.emit('game:chat-public:msg', JSON.stringify({ msg: 'me' }))
+        }
+      }
+    })
+    SOCKET.on('game-day-vote-set', (_data) => {
+      const data = JSON.parse(_data)
+      if (PLAYER && !DEADS.includes(PLAYER.id)) {
+        const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
+        if (ROLE && ROLE.id === 'priest') {
+          if (targetPlayer) addChatMsg(`💦 Kill ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+          SOCKET.emit('game-priest-kill-player', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+        } else if (ROLE && ROLE.id === 'vigilante') {
+          if (targetPlayer) addChatMsg(`🔫 Kill ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+          SOCKET.emit('game-vigilante-shoot', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+        } else if (ROLE && ROLE.id === 'gunner') {
+          if (targetPlayer) addChatMsg(`🔫 Kill ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+          SOCKET.emit('game-gunner-shoot-player', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+        }
+      }
+    })
+  }
+  SOCKET.onAny((...args) => {
+    log(args)
+  })
+}
+
+const messagesToCatch = {
+  'game-joined': (data) => {
+    const _data = Object.values(data)
+    const gameId = _data[0]
+    const serverUrl = _data[1]
+    setTimeout(() => {
+      connectSocket(gameId, serverUrl)
+    }, 1000)
+  },
+  disconnect: (data) => {
+    if (SOCKET) {
+      SOCKET.disconnect()
+    }
   },
 }
 
@@ -455,14 +618,13 @@ function setPlayersLevel() {
   // if ($('.lv-username').length) return
   if (!LV_SETTINGS.SHOW_HIDDEN_LVL) return
   PLAYERS.forEach((player) => {
-    const hide = !!(player.id === PLAYER.id && LV_SETTINGS.HIDE_USERNAME)
     const str = `${parseInt(player.gridIdx) + 1} ${player.username}`
     const el = $(`div:contains("${str}")`)
     const gridIdx = parseInt(player.gridIdx) + 1
-    const username = hide ? '???' : player.username
-    const level = hide ? '0' : player.level
+    const username = player.username
+    const level = player.level
     let clanTag = ''
-    if (player.clanTag) clanTag = hide ? '❓' : `${player.clanTag}`
+    if (player.clanTag) clanTag = `${player.clanTag}`
     let newUsername = `${gridIdx} ${username} [${level}] ${clanTag}`
     if (el.length) {
       el[el.length - 1].innerHTML = newUsername
@@ -538,6 +700,9 @@ function injectHistory() {
 
 function injectStyles() {
   $('html').append(lvStyles)
+  $('html').append(
+    '<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" integrity="sha384-2huaZvOR9iDzHqslqwpR87isEmrfxqyWOF7hr7BY6KG0+hVKLoEXMPUJw3ynWuhO" crossorigin="anonymous"></script>'
+  )
 }
 
 function messageParser(message) {
@@ -549,7 +714,7 @@ function messageParser(message) {
   try {
     parsedMessage = JSON.parse(tmp)
   } catch {
-    console.error('[LoupsVille] Error parsing message: ', message)
+    // console.error('[LoupsVille] Error parsing message: ', message)
   }
   return parsedMessage
 }
@@ -614,14 +779,6 @@ const lvModal = `
       <div class="lv-modal-section">
         <div class="lv-modal-subtitle">General</div>
         <div class="lv-modal-option">
-          <div class="lv-modal-checkbox hide-player lv-icon"></div>
-          <span>Hide your name and level (reload to take effect)</span>
-        </div>
-        <div class="lv-modal-option">
-          <div class="lv-modal-checkbox allow-multi lv-icon"></div>
-          <span>Allow playing several games simultaneously</span>
-        </div>
-        <div class="lv-modal-option">
           <div class="lv-modal-checkbox debug lv-icon"></div>
           <span>Debug mode</span>
         </div>
@@ -635,6 +792,10 @@ const lvModal = `
         <div class="lv-modal-option">
           <div class="lv-modal-checkbox auto-replay lv-icon"></div>
           <span>Replay when game is over (your game must be in english)</span>
+        </div>
+        <div class="lv-modal-option">
+          <div class="lv-modal-checkbox auto-play lv-icon"></div>
+          <span>Auto play in custom games (couples settings) <strong class="lv-new">NEW 🔥</strong></span></span>
         </div>
         <div class="lv-modal-option disabled">
           <div class="lv-modal-checkbox chat-stats lv-icon"></div>
@@ -824,6 +985,9 @@ div {
 .lv-modal-option.disabled .lv-coming-soon {
   color: #ffe31f !important;
 }
+.lv-modal-option .lv-new {
+  color:rgb(255, 2, 2) !important;
+}
 .lv-modal-option.disabled .lv-modal-checkbox {
   cursor: not-allowed !important;
 }
@@ -852,13 +1016,6 @@ const patchLocalStorage = () => {
     }
     orignalSetItem.apply(this, arguments)
   }
-  setTimeout(() => {
-    if (LV_SETTINGS.HIDE_USERNAME) {
-      let settings = JSON.parse(localStorage.getItem('settings'))
-      settings.hidePlayerNames = true
-      localStorage.setItem('settings', JSON.stringify(settings))
-    }
-  }, 1000)
 }
 
 const getHeaders = () => ({
