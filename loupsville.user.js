@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LoupsVille dev
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.3.0
 // @description  wolvesville mod
 // @author       me
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wolvesville.com
@@ -39,6 +39,9 @@ var LV_SETTINGS = {
 }
 var AUTO_REPLAY_INTERVAL = undefined
 var SOCKET = undefined
+var GAME_ID = undefined
+var SERVER_URL = undefined
+var GAME_SETTINGS = undefined
 
 const main = async () => {
   getAuthtokens()
@@ -108,10 +111,12 @@ const injectSettings = () => {
 const handleAutoReplay = () => {
   if (LV_SETTINGS.AUTO_REPLAY) {
     AUTO_REPLAY_INTERVAL = setInterval(() => {
-      $('div:contains("Rejouer")').click()
-      $('div:contains("Continuer")').click()
+      $('div:contains("START GAME")').click()
       $('div:contains("Play again")').click()
       $('div:contains("Continue")').click()
+      if ($('div:contains("Play again")').length) {
+        $('div:contains("OK")').click()
+      }
     }, 500)
   } else {
     clearInterval(AUTO_REPLAY_INTERVAL)
@@ -347,21 +352,20 @@ const onMessage = (message) => {
   }
 }
 
-const connectSocket = (gameId, serverUrl) => {
-  if (SOCKET) return
+const connectSocket = () => {
+  var HOSTING = false
   var LOVERS = []
   var DEADS = []
   var JW_TARGET = undefined
   var CHAT_WW_SENDED = false
   var WOLVES = []
-  const url = `wss://${serverUrl.replace('https://', '')}/`
+  var TARGET_WW_VOTE = undefined
+  const url = `wss://${SERVER_URL.replace('https://', '')}/`
   SOCKET = io(url, {
     query: {
       firebaseToken: AUTHTOKENS.idToken,
-      gameId,
+      gameId: GAME_ID,
       reconnect: true,
-      // gameMode: 'custom',
-      // password: undefined,
       ids: 1,
       'Cf-JWT': AUTHTOKENS['Cf-JWT'],
       apiV: 1,
@@ -374,39 +378,295 @@ const connectSocket = (gameId, serverUrl) => {
     SOCKET = undefined
   })
   SOCKET.on('game-joined', () => {
+    addChatMsg('🤖 Parallel socket connected')
+  })
+  SOCKET.on('game-players-killed', (_data) => {
+    const data = JSON.parse(_data)
+    data['victims'].forEach((victim) => {
+      const player = PLAYERS.find((v) => v.id === victim.targetPlayerId)
+      if (player) {
+        if (player) DEADS.push(player.id)
+        addChatMsg(
+          `☠️ ${parseInt(player.gridIdx) + 1}. ${player.username} (${victim.targetPlayerRole}) by ${victim.cause}`
+        )
+      }
+    })
+  })
+  SOCKET.on('game-cupid-lover-ids-and-roles', (_data) => {
+    const data = JSON.parse(_data)
+    if (PLAYER && ROLE) {
+      const loverPlayerIds = data.loverPlayerIds.filter((v) => v !== PLAYER.id)
+      const loverRoles = data.loverRoles.filter((v) => v !== ROLE.id)
+      LOVERS = loverPlayerIds.map((playerId, i) => ({ id: playerId, role: loverRoles[i] }))
+      if (LOVERS.length === 1) {
+        const lover1 = PLAYERS.find((v) => v.id === LOVERS[0].id)
+        addChatMsg(`💘 Your lover is ${lover1.gridIdx + 1}. ${lover1.username} (${LOVERS[0].role})`)
+      } else if (LOVERS.length === 2) {
+        const lover1 = PLAYERS.find((v) => v.id === LOVERS[0].id)
+        const lover2 = PLAYERS.find((v) => v.id === LOVERS[1].id)
+        addChatMsg(
+          `💘 Your lovers are ${lover1.gridIdx + 1}. ${lover1.username} (${LOVERS[0].role}) and ${
+            lover2.gridIdx + 1
+          }. ${lover2.username} (${LOVERS[1].role})`
+        )
+      }
+    }
+  })
+  SOCKET.on('game-night-started', () => {
+    setTimeout(() => {
+      if (ROLE && ROLE.team === 'WEREWOLF') {
+        const lover = LOVERS.find((v) => getRole(v.role).team !== 'WEREWOLF')
+        if (lover) {
+          const targetPlayer = PLAYERS.find((v) => v.id === lover.id)
+          if (targetPlayer) {
+            addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+          }
+          TARGET_WW_VOTE = lover.id
+          SOCKET.emit('game-werewolves-vote-set', JSON.stringify({ targetPlayerId: lover.id }))
+        }
+      }
+    }, 1000)
+  })
+  SOCKET.on('game-werewolves-set-roles', (_data) => {
+    const data = JSON.parse(_data)
+    WOLVES = Object.entries(data.werewolves).map(([id, role]) => ({ id, role }))
+    if (
+      !CHAT_WW_SENDED &&
+      LOVERS.length &&
+      WOLVES.length &&
+      ROLE.team === 'WEREWOLF' &&
+      ROLE.id === 'junior-werewolf' &&
+      LOVERS.find((v) => getRole(v.role).team !== 'WEREWOLF')
+    ) {
+      CHAT_WW_SENDED = true
+      setTimeout(() => {
+        SOCKET.emit('game:chat-werewolves:msg', JSON.stringify({ msg: `Who?` }))
+      }, 2000)
+    }
+  })
+  SOCKET.on('game:chat-werewolves:msg', (_data) => {
+    const data = JSON.parse(_data)
+    // Case wolf: answer when someone write Who?
+    if (
+      ROLE &&
+      ROLE.team === 'WEREWOLF' &&
+      data.authorId !== PLAYER.id &&
+      data.msg &&
+      data.msg.toLowerCase().includes('who')
+    ) {
+      const lover = PLAYERS.find((v) => v.id === LOVERS[0].id)
+      if (lover) {
+        setTimeout(() => {
+          SOCKET.emit('game:chat-werewolves:msg', JSON.stringify({ msg: `${lover.gridIdx + 1}` }))
+        }, 1000)
+      }
+    }
+    // Case you are junior: extract grid number from chat
+    if (ROLE && ROLE.id === 'junior-werewolf' && data.msg && data.authorId !== PLAYER.id) {
+      const numbers = data.msg.match(/\d+/)
+      if (numbers && numbers.length) {
+        const gridIdx = parseInt(numbers[0])
+        const targetPlayer = PLAYERS.find((v) => v.gridIdx + 1 === gridIdx)
+        if (targetPlayer) {
+          JW_TARGET = targetPlayer.id
+          addChatMsg(`🐾 Select ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+          SOCKET.emit('game-junior-werewolf-selected-player', JSON.stringify({ targetPlayerId: targetPlayer.id }))
+        }
+      }
+    }
+  })
+  SOCKET.on('game-werewolves-vote-set', (_data) => {
+    const data = JSON.parse(_data)
+    if (!JW_TARGET && ROLE && ROLE.id === 'junior-werewolf' && data.playerId !== PLAYER.id) {
+      JW_TARGET = data.targetPlayerId
+      const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
+      if (targetPlayer) {
+        addChatMsg(`🐾 Select ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+      }
+      SOCKET.emit('game-junior-werewolf-selected-player', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+    }
+    // Case your teammate is junior wolf and you're not
+    if (
+      ROLE &&
+      ROLE.id !== 'junior-werewolf' &&
+      WOLVES.find((v) => v.role === 'junior-werewolf' && v.id === data.playerId)
+    ) {
+      const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
+      setTimeout(() => {
+        if (targetPlayer) {
+          addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+        }
+        if (TARGET_WW_VOTE !== data.targetPlayerId) {
+          TARGET_WW_VOTE = data.targetPlayerId
+          SOCKET.emit('game-werewolves-vote-set', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+        }
+      }, 1000)
+    } else if (
+      ROLE &&
+      ROLE.id !== 'junior-werewolf' &&
+      !WOLVES.find((v) => v.role === 'junior-werewolf' && v.id === data.playerId) &&
+      LOVERS.find((v) => ['priest', 'vigilante', 'gunner'].includes(v.role))
+    ) {
+      // Case your lover is priest | vigilante | gunner: vote for your teammate lover
+      const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
+      setTimeout(() => {
+        if (targetPlayer) {
+          addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+        }
+        if (TARGET_WW_VOTE !== data.targetPlayerId) {
+          TARGET_WW_VOTE = data.targetPlayerId
+          SOCKET.emit('game-werewolves-vote-set', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+        }
+      }, 1000)
+    }
+  })
+  SOCKET.on('game-day-voting-started', () => {
+    if (PLAYER && !DEADS.includes(PLAYER.id)) {
+      const wwLover = LOVERS.find((v) => getRole(v.role).team === 'WEREWOLF')
+      if (wwLover) {
+        if (ROLE && ROLE.team === 'WEREWOLF') {
+          SOCKET.emit('game:chat-public:msg', JSON.stringify({ msg: 'wc' }))
+        }
+        const targetPlayer = PLAYERS.find((v) => v.id === wwLover.id)
+        if (targetPlayer) {
+          addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+        }
+        SOCKET.emit('game-day-vote-set', JSON.stringify({ targetPlayerId: wwLover.id }))
+      } else if (ROLE && ROLE.team === 'WEREWOLF') {
+        SOCKET.emit('game:chat-public:msg', JSON.stringify({ msg: 'me' }))
+      }
+    }
+  })
+  // Case nobody vote the wolf, and someone writes "me"
+  SOCKET.on('game:chat-public:msg', (_data) => {
+    const data = JSON.parse(_data)
+    if (
+      PLAYER &&
+      !DEADS.includes(PLAYER.id) &&
+      data.authorId !== PLAYER.id &&
+      data.msg &&
+      ROLE &&
+      ['priest', 'gunner', 'vigilante'].includes(ROLE.id) &&
+      ['Me', 'me', 'ME', 'm', 'M', 'wc', 'Wc', 'WC'].includes(data.msg)
+    ) {
+      const targetPlayer = PLAYERS.find((v) => v.id === data.authorId)
+      if (targetPlayer) {
+        addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+      }
+    }
+  })
+  SOCKET.on('game-day-vote-set', (_data) => {
+    const data = JSON.parse(_data)
+    if (PLAYER && !DEADS.includes(PLAYER.id)) {
+      const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
+      if (ROLE && ROLE.id === 'priest') {
+        setTimeout(() => {
+          if (targetPlayer) addChatMsg(`💦 Kill ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+          SOCKET.emit('game-priest-kill-player', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+        }, 1000)
+      } else if (ROLE && ROLE.id === 'vigilante') {
+        setTimeout(() => {
+          if (targetPlayer) addChatMsg(`🔫 Kill ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+          SOCKET.emit('game-vigilante-shoot', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+        }, 1000)
+      } else if (ROLE && ROLE.id === 'gunner') {
+        setTimeout(() => {
+          if (targetPlayer) addChatMsg(`🔫 Kill ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
+          SOCKET.emit('game-gunner-shoot-player', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
+        }, 1000)
+      }
+    }
+  })
+  SOCKET.on('host-changed', () => {
+    HOSTING = true
+  })
+  SOCKET.on('game-reconnect-set-players', (_data) => {
+    const data = JSON.parse(_data)
+    Object.values(data).forEach((player) => {
+      if (!player.isAlive) {
+        DEADS.push(player.id)
+      }
+    })
+  })
+  SOCKET.on('game-over-awards-available', () => {
+    SOCKET.disconnect()
+  })
+  // SOCKET.on('custom-new-game-available', (_data) => {
+  //   const data = JSON.parse(_data)
+  //   console.log(data)
+  // })
+  SOCKET.onAny((...args) => {
+    log(args)
+  })
+}
+
+const messagesToCatch = {
+  'game-joined': (data) => {
+    if (SOCKET) return
     addChatMsg('🔗 Game joined')
     DOCUMENT_TITLE = '🔗 Game joined'
-    addChatMsg('🤖 Parallel socket connected')
-    // SOCKET.emit('lobby:chat-msg', JSON.stringify({ msg: 'test' }))
-    ROLE = undefined
+    const _data = Object.values(data)
+    GAME_ID = _data[0]
+    SERVER_URL = _data[1]
     setTimeout(setPlayersLevel, 1000)
-  })
-  SOCKET.on('game-starting', () => {
-    GAME_STATUS = 'starting'
+  },
+  'game-settings-changed': (data) => {
+    GAME_SETTINGS = data
+  },
+  'game-starting': () => {
+    if (SOCKET) return
     addChatMsg('🚩 Game starting')
     DOCUMENT_TITLE = '🚩 Game starting'
-  })
-  SOCKET.on('game-started', (_data) => {
-    const data = JSON.parse(_data)
-    GAME_STATUS = 'started'
+    GAME_STATUS = 'starting'
+  },
+  'game-started': (data) => {
+    if (SOCKET) return
     addChatMsg('🚀 Game started')
     DOCUMENT_TITLE = '🚀 Game started'
+    GAME_STATUS = 'started'
     GAME_STARTED_AT = new Date().getTime()
     setRole(data.role)
     addChatMsg(`You are ${ROLE.name} (${ROLE.id})`, true, 'color: #FF4081;')
     DOCUMENT_TITLE = `⌛ ${ROLE.name}`
     PLAYERS = data.players
     setTimeout(setPlayersLevel, 1000)
-  })
-  SOCKET.on('players-and-equipped-items', (_data) => {
-    const data = JSON.parse(_data)
+    setTimeout(() => {
+      if (
+        !SOCKET &&
+        LV_SETTINGS.AUTO_PLAY &&
+        GAME_SETTINGS.gameMode === 'custom' &&
+        GAME_SETTINGS.allCoupled &&
+        GAME_ID &&
+        SERVER_URL
+      ) {
+        connectSocket()
+      }
+    }, 1000)
+  },
+  'player-joined-and-equipped-items': (data) => {},
+  'game-set-game-status': (data) => {},
+  'game-reconnect-set-game-status': (data) => {
+    setTimeout(() => {
+      if (
+        !SOCKET &&
+        LV_SETTINGS.AUTO_PLAY &&
+        GAME_SETTINGS.gameMode === 'custom' &&
+        GAME_SETTINGS.allCoupled &&
+        GAME_ID &&
+        SERVER_URL
+      ) {
+        connectSocket()
+      }
+    }, 1000)
+  },
+  'players-and-equipped-items': (data) => {
     if (GAME_STATUS === 'started') {
       PLAYERS = data.players
       setTimeout(setPlayersLevel, 1000)
     }
-  })
-  SOCKET.on('game-reconnect-set-players', (_data) => {
-    const data = JSON.parse(_data)
+  },
+  'game-reconnect-set-players': (data) => {
+    if (SOCKET) return
     PLAYERS = Object.values(data)
     setTimeout(setPlayersLevel, 1000)
     if (PLAYER) {
@@ -422,22 +682,25 @@ const connectSocket = (gameId, serverUrl) => {
         }
       }
     }
-  })
-  SOCKET.on('game-night-started', () => {
+  },
+  'game-night-started': () => {
     const tmp = PLAYERS.find((v) => v.id === PLAYER.id)
     if (tmp && ROLE) DOCUMENT_TITLE = `🚀 ${tmp.gridIdx + 1}. ${ROLE.name}`
     setTimeout(setPlayersLevel, 1000)
-  })
-  SOCKET.on('game-players-killed', (_data) => {
-    const data = JSON.parse(_data)
+  },
+  'game-players-killed': (data) => {
+    if (SOCKET) return
     data['victims'].forEach((victim) => {
       const player = PLAYERS.find((v) => v.id === victim.targetPlayerId)
-      if (player) DEADS.push(player.id)
-      const tmp = player ? `${parseInt(player.gridIdx) + 1}. ${player.username}` : '?'
-      addChatMsg(`☠️ ${tmp} (${victim.targetPlayerRole}) by ${victim.cause}`)
+      if (player) {
+        addChatMsg(
+          `☠️ ${parseInt(player.gridIdx) + 1}. ${player.username} (${victim.targetPlayerRole}) by ${victim.cause}`
+        )
+      }
     })
-  })
-  SOCKET.on('game-game-over', () => {
+  },
+  'game-game-over': () => {
+    if (GAME_STATUS === 'over') return
     GAME_STATUS = 'over'
     let tmp = `🏁 Game over`
     if (GAME_STARTED_AT) {
@@ -447,9 +710,9 @@ const connectSocket = (gameId, serverUrl) => {
     }
     DOCUMENT_TITLE = tmp
     addChatMsg(tmp)
-  })
-  SOCKET.on('game-over-awards-available', (_data) => {
-    const data = JSON.parse(_data)
+  },
+  'game-over-awards-available': (data) => {
+    if (SOCKET) return
     TOTAL_XP_SESSION += data.playerAward.awardedTotalXp
     addChatMsg(`🧪 ${data.playerAward.awardedTotalXp} xp`)
     if (data.playerAward.awardedLevels) {
@@ -457,153 +720,16 @@ const connectSocket = (gameId, serverUrl) => {
       TOTAL_UP_LEVEL += data.playerAward.awardedLevels
       log(`🆙 ${PLAYER.level}`)
     }
-    setTimeout(() => {
-      SOCKET.disconnect()
-    }, 100)
-  })
-  // Autoplay
-  if (LV_SETTINGS.AUTO_PLAY) {
-    SOCKET.on('game-cupid-lover-ids-and-roles', (_data) => {
-      const data = JSON.parse(_data)
-      if (PLAYER && ROLE) {
-        const loverPlayerIds = data.loverPlayerIds.filter((v) => v !== PLAYER.id)
-        const loverRoles = data.loverRoles.filter((v) => v !== ROLE.id)
-        LOVERS = loverPlayerIds.map((playerId, i) => ({ id: playerId, role: loverRoles[i] }))
-        let msg = ''
-        if (LOVERS.length === 1) {
-          const lover1 = PLAYERS.find((v) => v.id === LOVERS[0].id)
-          addChatMsg(`💘 Your lover is ${lover1.gridIdx + 1}. ${lover1.username} (${LOVERS[0].role})`)
-          if (ROLE.team === 'WEREWOLF') {
-            msg = `My lover is ${lover1.gridIdx + 1}, who is yours?`
-          }
-        } else if (LOVERS.length === 2) {
-          const lover1 = PLAYERS.find((v) => v.id === LOVERS[0].id)
-          const lover2 = PLAYERS.find((v) => v.id === LOVERS[1].id)
-          addChatMsg(
-            `💘 Your lovers are ${lover1.gridIdx + 1}. ${lover1.username} (${LOVERS[0].role}) and ${
-              lover2.gridIdx + 1
-            }. ${lover2.username} (${LOVERS[1].role})`
-          )
-          if (ROLE.team === 'WEREWOLF') {
-            msg = `My lovers are ${lover1.gridIdx + 1} and ${lover2.gridIdx + 1}, who is yours?`
-          }
-        }
-        if (!CHAT_WW_SENDED && msg) {
-          CHAT_WW_SENDED = true
-          SOCKET.emit('game:chat-werewolves:msg', JSON.stringify({ msg }))
-        }
-      }
-    })
-    SOCKET.on('game-night-started', () => {
-      setTimeout(() => {
-        if (ROLE && ROLE.team === 'WEREWOLF') {
-          const lover = LOVERS.find((v) => getRole(v.role).team !== 'WEREWOLF')
-          if (lover) {
-            const targetPlayer = PLAYERS.find((v) => v.id === lover.id)
-            if (targetPlayer) {
-              addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
-            }
-            SOCKET.emit('game-werewolves-vote-set', JSON.stringify({ targetPlayerId: lover.id }))
-          }
-        }
-      }, 1000)
-    })
-    SOCKET.on('game-werewolves-set-roles', (_data) => {
-      const data = JSON.parse(_data)
-      WOLVES = Object.entries(data.werewolves).map(([id, role]) => ({ id, role }))
-    })
-    SOCKET.on('game:chat-werewolves:msg', (_data) => {
-      const data = JSON.parse(_data)
-      if (ROLE && ROLE.id === 'junior-werewolf' && data.msg && data.authorId !== PLAYER.id) {
-        const numbers = data.msg.match(/\d+/)
-        if (numbers.length) {
-          const gridIdx = parseInt(numbers[0])
-          const targetPlayer = PLAYERS.find((v) => v.gridIdx + 1 === gridIdx)
-          if (targetPlayer) {
-            JW_TARGET = targetPlayer.id
-            addChatMsg(`🐾 Select ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
-            SOCKET.emit('game-junior-werewolf-selected-player', JSON.stringify({ targetPlayerId: targetPlayer.id }))
-          }
-        }
-      }
-    })
-    SOCKET.on('game-werewolves-vote-set', (_data) => {
-      const data = JSON.parse(_data)
-      if (!JW_TARGET && ROLE && ROLE.id === 'junior-werewolf' && data.playerId !== PLAYER.id) {
-        JW_TARGET = data.targetPlayerId
-        const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
-        if (targetPlayer) {
-          addChatMsg(`🐾 Select ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
-        }
-        SOCKET.emit('game-junior-werewolf-selected-player', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
-      }
-      // Case your teammate is junior wolf and you're not
-      if (
-        ROLE &&
-        ROLE.id !== 'junior-werewolf' &&
-        WOLVES.find((v) => v.role === 'junior-werewolf' && v.id === data.playerId)
-      ) {
-        const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
-        setTimeout(() => {
-          if (targetPlayer) {
-            addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
-          }
-          SOCKET.emit('game-werewolves-vote-set', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
-        }, 1000)
-      }
-    })
-    SOCKET.on('game-day-voting-started', () => {
-      if (PLAYER && !DEADS.includes(PLAYER.id)) {
-        const wwLover = LOVERS.find((v) => getRole(v.role).team === 'WEREWOLF')
-        if (wwLover) {
-          if (ROLE && ROLE.team === 'WEREWOLF') {
-            SOCKET.emit('game:chat-public:msg', JSON.stringify({ msg: 'wc' }))
-          }
-          const targetPlayer = PLAYERS.find((v) => v.id === wwLover.id)
-          if (targetPlayer) {
-            addChatMsg(`👉 Vote ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
-          }
-          SOCKET.emit('game-day-vote-set', JSON.stringify({ targetPlayerId: wwLover.id }))
-        } else if (ROLE && ROLE.team === 'WEREWOLF') {
-          SOCKET.emit('game:chat-public:msg', JSON.stringify({ msg: 'me' }))
-        }
-      }
-    })
-    SOCKET.on('game-day-vote-set', (_data) => {
-      const data = JSON.parse(_data)
-      if (PLAYER && !DEADS.includes(PLAYER.id)) {
-        const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
-        if (ROLE && ROLE.id === 'priest') {
-          if (targetPlayer) addChatMsg(`💦 Kill ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
-          SOCKET.emit('game-priest-kill-player', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
-        } else if (ROLE && ROLE.id === 'vigilante') {
-          if (targetPlayer) addChatMsg(`🔫 Kill ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
-          SOCKET.emit('game-vigilante-shoot', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
-        } else if (ROLE && ROLE.id === 'gunner') {
-          if (targetPlayer) addChatMsg(`🔫 Kill ${targetPlayer.gridIdx + 1}. ${targetPlayer.username}`)
-          SOCKET.emit('game-gunner-shoot-player', JSON.stringify({ targetPlayerId: data.targetPlayerId }))
-        }
-      }
-    })
-  }
-  SOCKET.onAny((...args) => {
-    log(args)
-  })
-}
-
-const messagesToCatch = {
-  'game-joined': (data) => {
-    const _data = Object.values(data)
-    const gameId = _data[0]
-    const serverUrl = _data[1]
-    setTimeout(() => {
-      connectSocket(gameId, serverUrl)
-    }, 1000)
   },
-  disconnect: (data) => {
-    if (SOCKET) {
-      SOCKET.disconnect()
-    }
+  disconnect: () => {
+    ROLE = undefined
+    PLAYERS = []
+    GAME_ID = undefined
+    SERVER_URL = undefined
+    GAME_SETTINGS = undefined
+    setTimeout(() => {
+      if (SOCKET) SOCKET.disconnect()
+    }, 1000)
   },
 }
 
@@ -615,7 +741,6 @@ const messageDispatcher = (message) => {
 }
 
 function setPlayersLevel() {
-  // if ($('.lv-username').length) return
   if (!LV_SETTINGS.SHOW_HIDDEN_LVL) return
   PLAYERS.forEach((player) => {
     const str = `${parseInt(player.gridIdx) + 1} ${player.username}`
@@ -700,9 +825,7 @@ function injectHistory() {
 
 function injectStyles() {
   $('html').append(lvStyles)
-  $('html').append(
-    '<script src="https://cdn.socket.io/4.7.5/socket.io.min.js" integrity="sha384-2huaZvOR9iDzHqslqwpR87isEmrfxqyWOF7hr7BY6KG0+hVKLoEXMPUJw3ynWuhO" crossorigin="anonymous"></script>'
-  )
+  $('html').append('<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.8.1/socket.io.js"></script>')
 }
 
 function messageParser(message) {
@@ -791,7 +914,7 @@ const lvModal = `
         </div>
         <div class="lv-modal-option">
           <div class="lv-modal-checkbox auto-replay lv-icon"></div>
-          <span>Replay when game is over (your game must be in english)</span>
+          <span>Auto replay when game is over (your game must be in english)</span>
         </div>
         <div class="lv-modal-option">
           <div class="lv-modal-checkbox auto-play lv-icon"></div>
