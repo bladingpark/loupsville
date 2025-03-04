@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         LoupsVille dev
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.4.0
 // @description  wolvesville mod
 // @author       me
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wolvesville.com
@@ -248,7 +248,7 @@ const requestsToCatch = {
       }
       $('.lv-modal-loot-boxes-status').text(`(${lootBoxes.length} 🎁 available)`)
     }
-    return new Response(JSON.stringify({ ...data, loyaltyTokenCount: 9999 }))
+    // return new Response(JSON.stringify({ ...data, loyaltyTokenCount: 9999,  }))
   },
   'https://game.api-wolvesville.com/api/public/game/running': (data) => {
     return new Response(JSON.stringify({ running: false }))
@@ -353,7 +353,6 @@ const onMessage = (message) => {
 }
 
 const connectSocket = () => {
-  var HOSTING = false
   var LOVERS = []
   var DEADS = []
   var JW_TARGET = undefined
@@ -477,6 +476,7 @@ const connectSocket = () => {
   })
   SOCKET.on('game-werewolves-vote-set', (_data) => {
     const data = JSON.parse(_data)
+    if (data.playerId === PLAYER.ID) return
     if (!JW_TARGET && ROLE && ROLE.id === 'junior-werewolf' && data.playerId !== PLAYER.id) {
       JW_TARGET = data.targetPlayerId
       const targetPlayer = PLAYERS.find((v) => v.id === data.targetPlayerId)
@@ -534,6 +534,25 @@ const connectSocket = () => {
         SOCKET.emit('game-day-vote-set', JSON.stringify({ targetPlayerId: wwLover.id }))
       } else if (ROLE && ROLE.team === 'WEREWOLF') {
         SOCKET.emit('game:chat-public:msg', JSON.stringify({ msg: 'me' }))
+      } else if (
+        ROLE &&
+        [
+          'serial-killer',
+          'arsonist',
+          'corruptor',
+          'bandit',
+          'cannibal',
+          'evil-detective',
+          'bomber',
+          'alchemist',
+          'siren',
+          'illusionist',
+          'blight',
+          'sect-leader',
+          'zombie',
+        ].includes(ROLE.id)
+      ) {
+        SOCKET.emit('game:chat-public:msg', JSON.stringify({ msg: 'solo' }))
       }
     }
   })
@@ -546,7 +565,7 @@ const connectSocket = () => {
       data.authorId !== PLAYER.id &&
       data.msg &&
       ROLE &&
-      ['priest', 'gunner', 'vigilante'].includes(ROLE.id) &&
+      ROLE.team === 'VILLAGER' &&
       ['Me', 'me', 'ME', 'm', 'M', 'wc', 'Wc', 'WC'].includes(data.msg)
     ) {
       const targetPlayer = PLAYERS.find((v) => v.id === data.authorId)
@@ -577,9 +596,6 @@ const connectSocket = () => {
       }
     }
   })
-  SOCKET.on('host-changed', () => {
-    HOSTING = true
-  })
   SOCKET.on('game-reconnect-set-players', (_data) => {
     const data = JSON.parse(_data)
     Object.values(data).forEach((player) => {
@@ -588,13 +604,24 @@ const connectSocket = () => {
       }
     })
   })
-  SOCKET.on('game-over-awards-available', () => {
-    SOCKET.disconnect()
+  SOCKET.on('game-over-awards-available', (_data) => {
+    const data = JSON.parse(_data)
+    if (data.playerAward.canClaimDoubleXp) {
+      SOCKET.emit('game-over-double-xp')
+      addChatMsg('Claim double xp', true, 'color:rgb(17, 255, 0);')
+    } else {
+      TOTAL_XP_SESSION += data.playerAward.awardedTotalXp
+      addChatMsg(`🧪 ${data.playerAward.awardedTotalXp} xp`)
+      if (data.playerAward.awardedLevels) {
+        PLAYER.level += data.playerAward.awardedLevels
+        TOTAL_UP_LEVEL += data.playerAward.awardedLevels
+        log(`🆙 ${PLAYER.level}`)
+      }
+      setTimeout(() => {
+        SOCKET.disconnect()
+      }, 500)
+    }
   })
-  // SOCKET.on('custom-new-game-available', (_data) => {
-  //   const data = JSON.parse(_data)
-  //   console.log(data)
-  // })
   SOCKET.onAny((...args) => {
     log(args)
   })
