@@ -1,9 +1,10 @@
 // ==UserScript==
 // @name         LoupsVille dev
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
+// @version      1.5.0
 // @description  wolvesville mod
-// @author       me
+// @author       bladingpark
+// @contributor  sharpedge
 // @icon         https://www.google.com/s2/favicons?sz=64&domain=wolvesville.com
 // @match        *://*.wolvesville.com/*
 // @require      https://code.jquery.com/jquery-3.6.0.min.js
@@ -39,6 +40,7 @@ var LV_SETTINGS = {
 }
 var AUTO_REPLAY_INTERVAL = undefined
 var SOCKET = undefined
+var REGULARSOCKET = undefined
 var GAME_ID = undefined
 var SERVER_URL = undefined
 var GAME_SETTINGS = undefined
@@ -351,6 +353,51 @@ const onMessage = (message) => {
     }
   }
 }
+const connectRegularSocket = () => {
+  const url = `wss://${SERVER_URL.replace('https://', '')}/`
+  REGULARSOCKET = io(url, {
+    query: {
+      firebaseToken: AUTHTOKENS.idToken,
+      gameId: GAME_ID,
+      reconnect: true,
+      ids: 1,
+      'Cf-JWT': AUTHTOKENS['Cf-JWT'],
+      apiV: 1,
+      EIO: 4,
+    },
+    transports: ['websocket'],
+  })
+
+  REGULARSOCKET.on('disconnect', () => {
+    addChatMsg('🤖 Parallel socket disconnected')
+    REGULARSOCKET = undefined
+  })
+  REGULARSOCKET.on('game-joined', () => {
+    addChatMsg('🤖 Parallel socket connected')
+  })
+
+  REGULARSOCKET.on('game-over-awards-available', (_data) => {
+    const data = JSON.parse(_data)
+    if (data.playerAward.canClaimDoubleXp) {
+      REGULARSOCKET.emit('game-over-double-xp')
+      addChatMsg('Claim double xp', true, 'color:rgb(17, 255, 0);')
+    } else {
+      TOTAL_XP_SESSION += data.playerAward.awardedTotalXp
+      addChatMsg(`🧪 ${data.playerAward.awardedTotalXp} xp`)
+      if (data.playerAward.awardedLevels) {
+        PLAYER.level += data.playerAward.awardedLevels
+        TOTAL_UP_LEVEL += data.playerAward.awardedLevels
+        log(`🆙 ${PLAYER.level}`)
+      }
+      setTimeout(() => {
+        REGULARSOCKET.disconnect()
+      }, 500)
+    }
+  })
+  REGULARSOCKET.onAny((...args) => {
+    log(args)
+  })
+}
 
 const connectSocket = () => {
   var LOVERS = []
@@ -629,7 +676,7 @@ const connectSocket = () => {
 
 const messagesToCatch = {
   'game-joined': (data) => {
-    if (SOCKET) return
+    if (SOCKET || REGULARSOCKET) return
     addChatMsg('🔗 Game joined')
     DOCUMENT_TITLE = '🔗 Game joined'
     const _data = Object.values(data)
@@ -641,13 +688,13 @@ const messagesToCatch = {
     GAME_SETTINGS = data
   },
   'game-starting': () => {
-    if (SOCKET) return
+    if (SOCKET || REGULARSOCKET) return
     addChatMsg('🚩 Game starting')
     DOCUMENT_TITLE = '🚩 Game starting'
     GAME_STATUS = 'starting'
   },
   'game-started': (data) => {
-    if (SOCKET) return
+    if (SOCKET || REGULARSOCKET) return
     addChatMsg('🚀 Game started')
     DOCUMENT_TITLE = '🚀 Game started'
     GAME_STATUS = 'started'
@@ -668,6 +715,9 @@ const messagesToCatch = {
       ) {
         connectSocket()
       }
+      if(!REGULARSOCKET && !(GAME_SETTINGS.gameMode === 'custom') && GAME_ID && SERVER_URL){
+        connectRegularSocket()
+      }
     }, 1000)
   },
   'player-joined-and-equipped-items': (data) => {},
@@ -684,6 +734,9 @@ const messagesToCatch = {
       ) {
         connectSocket()
       }
+      if(!REGULARSOCKET && !(GAME_SETTINGS.gameMode === 'custom') && GAME_ID && SERVER_URL){
+        connectRegularSocket()
+      }
     }, 1000)
   },
   'players-and-equipped-items': (data) => {
@@ -693,7 +746,7 @@ const messagesToCatch = {
     }
   },
   'game-reconnect-set-players': (data) => {
-    if (SOCKET) return
+    if (SOCKET || REGULARSOCKET) return
     PLAYERS = Object.values(data)
     setTimeout(setPlayersLevel, 1000)
     if (PLAYER) {
@@ -716,7 +769,7 @@ const messagesToCatch = {
     setTimeout(setPlayersLevel, 1000)
   },
   'game-players-killed': (data) => {
-    if (SOCKET) return
+    if (SOCKET || REGULARSOCKET) return
     data['victims'].forEach((victim) => {
       const player = PLAYERS.find((v) => v.id === victim.targetPlayerId)
       if (player) {
@@ -739,7 +792,7 @@ const messagesToCatch = {
     addChatMsg(tmp)
   },
   'game-over-awards-available': (data) => {
-    if (SOCKET) return
+    if (SOCKET || REGULARSOCKET) return
     TOTAL_XP_SESSION += data.playerAward.awardedTotalXp
     addChatMsg(`🧪 ${data.playerAward.awardedTotalXp} xp`)
     if (data.playerAward.awardedLevels) {
@@ -756,6 +809,7 @@ const messagesToCatch = {
     GAME_SETTINGS = undefined
     setTimeout(() => {
       if (SOCKET) SOCKET.disconnect()
+      if (REGULARSOCKET) REGULARSOCKET.disconnect()
     }, 1000)
   },
 }
